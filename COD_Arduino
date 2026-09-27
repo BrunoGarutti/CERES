@@ -1,0 +1,241 @@
+/*
+  ================================================================
+  Sistema de Irrigação Automática com Energia Solar + Envio de Dados
+  ================================================================
+  IMPORTANTE: para enviar dados via WiFi, este código deve rodar em
+  uma placa com WiFi integrado, como o ESP32 (recomendado) ou ESP8266.
+  O Arduino Uno/Nano puro NÃO possui WiFi — seria necessário um
+  módulo externo (ex: ESP8266 como shield). Este exemplo assume ESP32.
+================================================================
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ---------------------- CONFIGURAÇÃO WIFI ----------------------
+const char* SSID_WIFI    = "NOME_DA_SUA_REDE";
+const char* SENHA_WIFI   = "SENHA_DA_SUA_REDE";
+
+// ---------------------- CONFIGURAÇÃO DO SERVIDOR/APP ----------------------
+const char* URL_SERVIDOR = "http://SEU_SERVIDOR.com/api/irrigacao";
+
+// ---------------------- CONFIGURAÇÃO DE PINOS ----------------------
+const int PINO_SENSOR_UMIDADE = 34;   // Pino ADC do ESP32
+const int PINO_RELE_BOMBA     = 26;
+const int PINO_LED_STATUS     = 27;
+
+// ---------------------- CALIBRAÇÃO DO SENSOR ----------------------
+const int VALOR_SOLO_SECO   = 4095;   // ESP32 ADC de 12 bits (0-4095)
+const int VALOR_SOLO_UMIDO  = 1200;
+
+// ---------------------- PARÂMETROS DE IRRIGAÇÃO ----------------------
+const float LIMITE_UMIDADE_MINIMA = 30.0;
+const float LIMITE_UMIDADE_MAXIMA = 70.0;
+
+const unsigned long INTERVALO_LEITURA = 5000;
+const unsigned long INTERVALO_ENVIO   = 60000;
+
+// ---------------------- ESTIMATIVA DE VAZÃO DA BOMBA ----------------------
+const float VAZAO_BOMBA_L_POR_MIN = 2.0;
+
+// ---------------------- DETECÇÃO DE DESPERDÍCIO ----------------------
+const unsigned long TEMPO_MAX_IRRIGACAO_MS = 10UL * 60UL * 1000UL;
+
+// ---------------------- VARIÁVEIS GLOBAIS ----------------------
+unsigned long ultimaLeitura = 0;
+unsigned long ultimoEnvio   = 0;
+bool bombaLigada = false;
+unsigned long inicioIrrigacaoAtual = 0;
+
+float umidadeAtual              = 0.0;
+unsigned long tempoTotalIrrigado_ms = 0;
+float aguaUsadaLitros           = 0.0;
+float aguaEconomizadaLitros     = 0.0;
+int   vezesIrrigou              = 0;
+int   vezesEvitouIrrigar        = 0;
+bool  possivelDesperdicio        = false;
+
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PINO_RELE_BOMBA, OUTPUT);
+  pinMode(PINO_LED_STATUS, OUTPUT);
+  digitalWrite(PINO_RELE_BOMBA, LOW);
+  digitalWrite(PINO_LED_STATUS, LOW);
+
+  conectarWiFi();
+
+  Serial.println("=================================================");
+  Serial.println(" Sistema de Irrigacao Automatica + Envio de Dados");
+  Serial.println("=================================================");
+}
+
+// ================================================================
+void loop() {
+  unsigned long agora = millis();
+
+  if (agora - ultimaLeitura >= INTERVALO_LEITURA) {
+    ultimaLeitura = agora;
+
+    umidadeAtual = lerUmidadeSolo();
+    exibirUmidade(umidadeAtual);
+
+    bool precisaIrrigar = verificarNecessidadeIrrigacao(umidadeAtual);
+    controlarBomba(precisaIrrigar);
+    verificarDesperdicio();
+  }
+
+  if (agora - ultimoEnvio >= INTERVALO_ENVIO) {
+    ultimoEnvio = agora;
+    enviarDadosParaApp();
+  }
+}
+
+// ================================================================
+float lerUmidadeSolo() {
+  int leituraBruta = analogRead(PINO_SENSOR_UMIDADE);
+  float umidadePercentual = map(leituraBruta, VALOR_SOLO_SECO, VALOR_SOLO_UMIDO, 0, 100);
+  umidadePercentual = constrain(umidadePercentual, 0, 100);
+  return umidadePercentual;
+}
+
+void exibirUmidade(float umidade) {
+  Serial.print("Umidade do solo: ");
+  Serial.print(umidade, 1);
+  Serial.println(" %");
+}
+
+// ================================================================
+bool verificarNecessidadeIrrigacao(float umidade) {
+  if (umidade < LIMITE_UMIDADE_MINIMA) {
+    return true;
+  }
+  else if (umidade > LIMITE_UMIDADE_MAXIMA) {
+    if (bombaLigada) {
+      vezesEvitouIrrigar++;
+    }
+    return false;
+  }
+  return bombaLigada;
+}
+
+// ================================================================
+void controlarBomba(bool precisaIrrigar) {
+  if (precisaIrrigar && !bombaLigada) {
+    digitalWrite(PINO_RELE_BOMBA, HIGH);
+    digitalWrite(PINO_LED_STATUS, HIGH);
+    bombaLigada = true;
+    inicioIrrigacaoAtual = millis();
+    vezesIrrigou++;
+    Serial.println(">> Umidade baixa! Irrigacao ATIVADA.");
+  }
+  else if (!precisaIrrigar && bombaLigada) {
+    digitalWrite(PINO_RELE_BOMBA, LOW);
+    digitalWrite(PINO_LED_STATUS, LOW);
+    bombaLigada = false;
+
+    unsigned long duracao = millis() - inicioIrrigacaoAtual;
+    tempoTotalIrrigado_ms += duracao;
+
+    float litrosUsados = (duracao / 60000.0) * VAZAO_BOMBA_L_POR_MIN;
+    aguaUsadaLitros += litrosUsados;
+
+    Serial.println(">> Umidade adequada. Irrigacao DESATIVADA.");
+    Serial.print(">> Volume estimado nesta irrigacao: ");
+    Serial.print(litrosUsados, 2);
+    Serial.println(" L");
+  }
+}
+
+// ================================================================
+void verificarDesperdicio() {
+  if (bombaLigada) {
+    unsigned long duracaoAtual = millis() - inicioIrrigacaoAtual;
+    if (duracaoAtual > TEMPO_MAX_IRRIGACAO_MS) {
+      possivelDesperdicio = true;
+      Serial.println(">> ALERTA: irrigacao continua ha muito tempo! Possivel desperdicio.");
+      digitalWrite(PINO_RELE_BOMBA, LOW);
+      digitalWrite(PINO_LED_STATUS, LOW);
+      bombaLigada = false;
+
+      unsigned long duracao = millis() - inicioIrrigacaoAtual;
+      tempoTotalIrrigado_ms += duracao;
+      aguaUsadaLitros += (duracao / 60000.0) * VAZAO_BOMBA_L_POR_MIN;
+    }
+  }
+}
+
+// ================================================================
+void conectarWiFi() {
+  Serial.print("Conectando ao WiFi");
+  WiFi.begin(SSID_WIFI, SENHA_WIFI);
+
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi conectado!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFalha ao conectar no WiFi. Tentara novamente depois.");
+  }
+}
+
+// ================================================================
+void enviarDadosParaApp() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi desconectado. Tentando reconectar...");
+    conectarWiFi();
+    if (WiFi.status() != WL_CONNECTED) return;
+  }
+
+  HTTPClient http;
+  http.begin(URL_SERVIDOR);
+  http.addHeader("Content-Type", "application/json");
+
+  String json = "{";
+  json += "\"umidade_solo\":" + String(umidadeAtual, 1) + ",";
+  json += "\"bomba_ligada\":" + String(bombaLigada ? "true" : "false") + ",";
+  json += "\"tempo_total_irrigado_seg\":" + String(tempoTotalIrrigado_ms / 1000) + ",";
+  json += "\"agua_usada_litros\":" + String(aguaUsadaLitros, 2) + ",";
+  json += "\"agua_economizada_litros\":" + String(aguaEconomizadaEstimada(), 2) + ",";
+  json += "\"vezes_irrigou\":" + String(vezesIrrigou) + ",";
+  json += "\"vezes_evitou_irrigar\":" + String(vezesEvitouIrrigar) + ",";
+  json += "\"possivel_desperdicio\":" + String(possivelDesperdicio ? "true" : "false") + ",";
+  json += "\"timestamp_ms\":" + String(millis());
+  json += "}";
+
+  Serial.println(">> Enviando dados para o aplicativo:");
+  Serial.println(json);
+
+  int codigoResposta = http.POST(json);
+
+  if (codigoResposta > 0) {
+    Serial.print(">> Resposta do servidor: ");
+    Serial.println(codigoResposta);
+    String resposta = http.getString();
+    Serial.println(resposta);
+  } else {
+    Serial.print(">> Erro ao enviar dados: ");
+    Serial.println(http.errorToString(codigoResposta));
+  }
+
+  http.end();
+  possivelDesperdicio = false;
+}
+
+// ================================================================
+float aguaEconomizadaEstimada() {
+  if (vezesIrrigou == 0) return 0.0;
+
+  float duracaoMediaMin = (tempoTotalIrrigado_ms / 60000.0) / vezesIrrigou;
+  float litrosPorIrrigacaoMedia = duracaoMediaMin * VAZAO_BOMBA_L_POR_MIN;
+
+  return vezesEvitouIrrigar * litrosPorIrrigacaoMedia;
+}
